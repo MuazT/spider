@@ -20,6 +20,46 @@ use crate::apps::{
 /// supported") and gate calling behind.
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
+/// WebKitGTK does not expose navigator.mediaDevices inside workers on all
+/// call apps. Some pages only do a worker-side capability probe before they
+/// request access from the main thread. We must satisfy that probe without
+/// fabricating a fake MediaStream, because doing so breaks actual remote/local
+/// video rendering.
+fn worker_media_devices_probe_shim() -> String {
+    r#"
+(function() {
+    if (typeof Worker === 'undefined') return;
+
+    var nav = (typeof navigator !== 'undefined') ? navigator : null;
+    if (nav && nav.mediaDevices && typeof nav.mediaDevices.enumerateDevices === 'function') return;
+
+    var mediaDevices = {
+        enumerateDevices: function () { return Promise.resolve([]); },
+        getSupportedConstraints: function () { return {}; },
+        getUserMedia: function () {
+            return Promise.reject(new DOMException(
+                'Camera and microphone access are available only from the main thread.',
+                'NotSupportedError'
+            ));
+        },
+        ondevicechange: null
+    };
+
+    try {
+        if (typeof navigator !== 'undefined') {
+            Object.defineProperty(navigator, 'mediaDevices', {
+                value: mediaDevices,
+                configurable: true,
+                enumerable: true,
+                writable: true
+            });
+        }
+    } catch (e) {}
+})();
+"#
+    .to_string()
+}
+
 fn format_css(id: &str, bg: &str, fg: &str) -> String {
     format!(
         r#"window#s{id} {{
@@ -398,174 +438,10 @@ mod imp {
 "#,
                 v = chrome_major
             );
-            // Injected at document start; plain raw string (no format!), so
-            // braces here are literal JS braces.
-            let worker_shim = r#"
-// WebKitGTK does not expose navigator.mediaDevices inside Web Workers, so
-// Chromium-only apps (e.g. WhatsApp Web) that probe cameras from a worker
-// conclude there is no camera. Two-part fix:
-//  1. Prefix every JavaScript Blob with a bridge that defines
-//     navigator.mediaDevices and forwards calls to the main thread over
-//     postMessage (covers classic and module blob workers).
-//  2. Wrap Worker() so same-origin URL workers get the same bridge and so
-//     RPC replies are routed back into each worker instance.
-(function() {
-    if (typeof Worker === 'undefined') return;
-    if (typeof navigator === 'undefined' || !navigator.mediaDevices ||
-        typeof navigator.mediaDevices.enumerateDevices !== 'function') return;
-
-    var BRIDGE = [
-        "(function () {",
-        "  if (typeof navigator === 'undefined') return;",
-        "  if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function' &&",
-        "      typeof navigator.mediaDevices.getUserMedia === 'function') return;",
-        "  var seq = 0, pending = {};",
-        "  function call(method, args) {",
-        "    return new Promise(function (resolve, reject) {",
-        "      var id = ++seq;",
-        "      pending[id] = { resolve: resolve, reject: reject };",
-        "      self.postMessage({ __spiderMediaRPC: true, id: id, method: method, args: args });",
-        "    });",
-        "  }",
-        "  self.addEventListener('message', function (e) {",
-        "    var d = e && e.data;",
-        "    if (!d || d.__spiderMediaRPCResult !== true) return;",
-        "    var p = pending[d.id];",
-        "    if (!p) return;",
-        "    delete pending[d.id];",
-        "    function mkStream(desc) {",
-        "      var ts = (desc.tracks || []).map(function (t) {",
-        "        return {",
-        "          id: t.id, kind: t.kind, label: t.label, readyState: t.readyState,",
-        "          muted: t.muted, enabled: true,",
-        "          getSettings: function () { return t.settings || {}; },",
-        "          getCapabilities: function () { return {}; },",
-        "          stop: function () {",
-        "            self.postMessage({ __spiderMediaStop: true, trackId: t.id });",
-        "          }",
-        "        };",
-        "      });",
-        "      return {",
-        "        active: true,",
-        "        id: desc.id || 'spider',",
-        "        getTracks: function () { return ts.slice(); },",
-        "        getVideoTracks: function () { return ts.filter(function (t) { return t.kind === 'video'; }); },",
-        "        getAudioTracks: function () { return ts.filter(function (t) { return t.kind === 'audio'; }); },",
-        "        getTrackById: function (i) { return ts.filter(function (t) { return t.id === i; })[0] || null; },",
-        "        addEventListener: function () {}, removeEventListener: function () {},",
-        "        dispatchEvent: function () { return false; }",
-        "      };",
-        "    }",
-        "    if (d.error) { var err = new Error(d.error.message || ''); err.name = d.error.name || 'Error'; p.reject(err); }",
-        "    else if (d.result && d.result.__spiderMediaStream) p.resolve(mkStream(d.result));",
-        "    else p.resolve(d.result);",
-        "  });",
-        "  Object.defineProperty(self.navigator, 'mediaDevices', { value: {",
-        "    enumerateDevices: function () { return call('enumerateDevices', []); },",
-        "    getUserMedia: function (c) { return call('getUserMedia', [c]); },",
-        "    getSupportedConstraints: function () { return {}; },",
-        "    ondevicechange: null",
-        "  }, configurable: true });",
-        "})();"
-    ].join('\n');
-
-    var streamRefs = {};
-    function cloneForWorker(res) {
-        try {
-            if (typeof MediaStream !== 'undefined' && res instanceof MediaStream) {
-                var id = 's' + Math.random().toString(36).slice(2);
-                streamRefs[id] = res;
-                return { __spiderMediaStream: true, id: id,
-                    tracks: res.getTracks().map(function (t) {
-                        return { id: t.id, kind: t.kind, label: t.label,
-                            readyState: t.readyState, muted: t.muted,
-                            settings: (t.getSettings && t.getSettings()) || {} };
-                    }) };
-            }
-            if (Array.isArray(res)) return res.map(function (d) {
-                return { deviceId: d.deviceId, groupId: d.groupId,
-                    kind: d.kind, label: d.label };
-            });
-            return res;
-        } catch (e) { return null; }
-    }
-
-    function attachRPC(worker) {
-        try {
-            worker.addEventListener('message', function (ev) {
-                var d = ev && ev.data;
-                if (d && d.__spiderMediaStop === true) {
-                    Object.keys(streamRefs).forEach(function (k) {
-                        streamRefs[k].getTracks().forEach(function (t) {
-                            if (t.id === d.trackId) { t.stop(); delete streamRefs[k]; }
-                        });
-                    });
-                    return;
-                }
-                if (!d || d.__spiderMediaRPC !== true) return;
-                var fn = navigator.mediaDevices[d.method];
-                if (typeof fn !== 'function') {
-                    worker.postMessage({ __spiderMediaRPCResult: true, id: d.id,
-                        error: { name: 'NotSupportedError', message: String(d.method) + ' unavailable' } });
-                    return;
-                }
-                fn.apply(navigator.mediaDevices, d.args || []).then(function (res) {
-                    worker.postMessage({ __spiderMediaRPCResult: true, id: d.id, result: cloneForWorker(res) });
-                }).catch(function (err) {
-                    worker.postMessage({ __spiderMediaRPCResult: true, id: d.id,
-                        error: { name: err && err.name || 'Error', message: err && err.message || '' } });
-                });
-            });
-        } catch (e) {}
-        return worker;
-    }
-
-    // 1) Prefix JavaScript blobs (covers blob workers, classic and module)
-    if (typeof Blob === 'function') {
-        var OrigBlob = Blob;
-        var SpiderBlob = function (chunks, opts) {
-            var t = (opts && opts.type) || '';
-            var isArrayLike = chunks && typeof chunks.length === 'number' &&
-                !(chunks instanceof ArrayBuffer) &&
-                !(typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView && ArrayBuffer.isView(chunks));
-            if (/javascript/i.test(t) && isArrayLike) {
-                var parts = [BRIDGE];
-                for (var i = 0; i < chunks.length; i++) parts.push(chunks[i]);
-                return new OrigBlob(parts, opts);
-            }
-            return new OrigBlob(chunks, opts);
-        };
-        SpiderBlob.prototype = OrigBlob.prototype;
-        try { window.Blob = SpiderBlob; } catch (e) {}
-    }
-
-    // 2) Wrap Worker so RPC replies reach each worker instance. URL workers
-    //    are passed through untouched (no re-hosting: it breaks relative
-    //    imports); blob workers were already prefixed above.
-    var OrigWorker = Worker;
-    var SpiderWorker = function (url, options) {
-        return attachRPC(new OrigWorker(url, options));
-    };
-    SpiderWorker.prototype = OrigWorker.prototype;
-    try { window.Worker = SpiderWorker; } catch (e) {}
-
-    // Make the wrappers indistinguishable from natives for code that
-    // inspects fn.toString()/fn.name before booting.
-    function disguise(fn, name) {
-        try {
-            Object.defineProperty(fn, 'name', { value: name });
-            var src = 'function ' + name + '() { [native code] }';
-            Object.defineProperty(fn, 'toString', { value: function () { return src; } });
-        } catch (e) {}
-    }
-    try { disguise(SpiderBlob, 'Blob'); } catch (e) {}
-    try { disguise(SpiderWorker, 'Worker'); } catch (e) {}
-})();
-"#;
             // Escape hatch: SPIDER_NO_WORKER_SHIM=1 disables the worker
-            // mediaDevices bridge for debugging.
+            // mediaDevices probe shim for debugging.
             let ua_ch_shim = if std::env::var_os("SPIDER_NO_WORKER_SHIM").is_none() {
-                format!("{}\n{}", ua_ch_shim, worker_shim)
+                format!("{}\n{}", ua_ch_shim, worker_media_devices_probe_shim())
             } else {
                 ua_ch_shim
             };
@@ -1076,4 +952,19 @@ fn permission_request(
         }
     });
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_media_devices_probe_shim;
+
+    #[test]
+    fn worker_media_probe_shim_does_not_fake_streams() {
+        let shim = worker_media_devices_probe_shim();
+        assert!(shim.contains("enumerateDevices"));
+        assert!(shim.contains("getSupportedConstraints"));
+        assert!(!shim.contains("__spiderMediaStream"));
+        assert!(!shim.contains("getTracks"));
+        assert!(!shim.contains("postMessage({ __spiderMediaRPC"));
+    }
 }
