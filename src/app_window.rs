@@ -539,27 +539,36 @@ mod imp {
         try { window.Blob = SpiderBlob; } catch (e) {}
     }
 
-    // 2) Wrap Worker for same-origin URL workers (blob: already handled above)
+    // 2) Wrap Worker so RPC replies reach each worker instance. URL workers
+    //    are passed through untouched (no re-hosting: it breaks relative
+    //    imports); blob workers were already prefixed above.
     var OrigWorker = Worker;
     var SpiderWorker = function (url, options) {
-        var s = '';
-        try { s = String(url); } catch (e) {}
-        var isModule = options && /module/i.test(options.type || '');
-        var sameOrigin = s.charAt(0) === '/' && s.charAt(1) !== '/' ||
-            (typeof location !== 'undefined' && s.indexOf(location.origin + '/') === 0);
-        if (!isModule && !/^blob:/.test(s) && sameOrigin) {
-            try {
-                var boot = BRIDGE + "\n;try { importScripts(" + JSON.stringify(s) + "); } catch (e) {}\n";
-                return attachRPC(new OrigWorker(URL.createObjectURL(new OrigBlob([boot], { type: 'text/javascript' })), options));
-            } catch (e) {}
-        }
         return attachRPC(new OrigWorker(url, options));
     };
     SpiderWorker.prototype = OrigWorker.prototype;
     try { window.Worker = SpiderWorker; } catch (e) {}
+
+    // Make the wrappers indistinguishable from natives for code that
+    // inspects fn.toString()/fn.name before booting.
+    function disguise(fn, name) {
+        try {
+            Object.defineProperty(fn, 'name', { value: name });
+            var src = 'function ' + name + '() { [native code] }';
+            Object.defineProperty(fn, 'toString', { value: function () { return src; } });
+        } catch (e) {}
+    }
+    try { disguise(SpiderBlob, 'Blob'); } catch (e) {}
+    try { disguise(SpiderWorker, 'Worker'); } catch (e) {}
 })();
 "#;
-            let ua_ch_shim = format!("{}\n{}", ua_ch_shim, worker_shim);
+            // Escape hatch: SPIDER_NO_WORKER_SHIM=1 disables the worker
+            // mediaDevices bridge for debugging.
+            let ua_ch_shim = if std::env::var_os("SPIDER_NO_WORKER_SHIM").is_none() {
+                format!("{}\n{}", ua_ch_shim, worker_shim)
+            } else {
+                ua_ch_shim
+            };
             let shim_script = webkit::UserScript::new(
                 &ua_ch_shim,
                 webkit::UserContentInjectedFrames::AllFrames,
