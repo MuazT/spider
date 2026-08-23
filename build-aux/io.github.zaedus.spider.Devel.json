@@ -3,19 +3,24 @@
   "runtime": "org.gnome.Platform",
   "runtime-version": "50",
   "sdk": "org.gnome.Sdk",
-  "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
   "command": "spider",
   "finish-args": [
     "--share=network",
     "--share=ipc",
     "--socket=fallback-x11",
-    "--device=dri",
+    "--device=all",
     "--socket=wayland",
-    "--socket=pulseaudio"
+    "--socket=pulseaudio",
+    "--filesystem=/run/udev:ro"
   ],
   "build-options": {
     "append-path": "/usr/lib/sdk/rust-stable/bin",
-    "build-args": ["--share=network"],
+    "build-args": [
+      "--share=network"
+    ],
     "env": {
       "RUST_BACKTRACE": "1",
       "RUST_LOG": "spider=debug"
@@ -23,25 +28,100 @@
   },
   "modules": [
     {
-      "name": "blueprint-compiler",
-      "buildsystem": "meson",
-      "cleanup": ["*"],
+      "name": "unifdef",
+      "buildsystem": "simple",
+      "build-commands": [
+        "printf '#define UNIFDEF_VERSION \"unifdef-2.12\"\\n' > version.h",
+        "cc -std=gnu17 -O2 -I. -o unifdef unifdef.c",
+        "install -Dm0755 unifdef /app/bin/unifdef"
+      ],
       "sources": [
         {
-          "type": "git",
-          "url": "https://gitlab.gnome.org/jwestman/blueprint-compiler",
-          "tag": "v0.18.0"
+          "type": "archive",
+          "url": "https://github.com/fanf2/unifdef/archive/refs/tags/unifdef-2.12.tar.gz",
+          "sha256": "030369db9ff917acfae7fa4e90bcc1dff8a8dc534d82d1c72c12ef698d2f20e4"
         }
       ]
+    },
+    {
+      "name": "webkitgtk",
+      "buildsystem": "cmake-ninja",
+      "builddir": true,
+      "config-opts": [
+        "-DPORT=GTK",
+        "-DUSE_GTK4=ON",
+        "-DENABLE_WEB_RTC=ON",
+        "-DENABLE_MEDIA_STREAM=ON",
+        "-DENABLE_DOCUMENTATION=OFF",
+        "-DENABLE_MINIBROWSER=OFF",
+        "-DENABLE_WEBDRIVER=OFF",
+        "-DENABLE_INTROSPECTION=OFF",
+        "-DUSE_LIBBACKTRACE=OFF",
+        "-DENABLE_SPEECH_SYNTHESIS=OFF",
+        "-DUSE_THIN_ARCHIVES=OFF",
+        "-DCMAKE_BUILD_TYPE=Release"
+      ],
+      "cleanup": [
+        "/include",
+        "/lib/pkgconfig",
+        "/share/gtk-doc",
+        "/bin/MiniBrowser",
+        "/bin/jsc*"
+      ],
+      "sources": [
+        {
+          "type": "archive",
+          "url": "https://webkitgtk.org/releases/webkitgtk-2.52.6.tar.xz",
+          "sha256": "179a2ea3f8f6edd4be7f31fdc55afc57bd0729f1fba648c61d4181539ac116fc"
+        },
+        {
+          "type": "patch",
+          "path": "sab-default-on.patch"
+        }
+      ],
+      "build-options": {
+        "env": {
+          "CFLAGS": "-O2 -pipe -Wp,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -fexceptions -fstack-protector-strong -grecord-gcc-switches -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer",
+          "CXXFLAGS": "-O2 -pipe -Wp,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -fexceptions -fstack-protector-strong -grecord-gcc-switches -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer"
+        }
+      },
+      "build-commands": []
     },
     {
       "name": "spider",
       "builddir": true,
       "buildsystem": "meson",
+      "build-options": {
+        "env": {
+          "CARGO_HOME": "/run/build/spider/cargo",
+          "RUST_BACKTRACE": "1",
+          "RUST_LOG": "spider=debug"
+        },
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "build-args": [
+          "--share=network"
+        ]
+      },
+      "config-opts": [
+        "-Dflatpak=true"
+      ],
       "sources": [
         {
           "type": "git",
-          "url": "../.."
+          "url": "https://github.com/MuazT/spider.git",
+          "commit": "4a141fcd535648ca9c88c5f1058d436346510da1"
+        },
+        "generated-sources.json",
+        {
+          "type": "dir",
+          "path": "../vendor",
+          "dest": "vendor"
+        },
+        {
+          "type": "file",
+          "path": "../.cargo/config.toml",
+          "dest": ".cargo",
+          "dest-filename": "config.toml"
         }
       ]
     }

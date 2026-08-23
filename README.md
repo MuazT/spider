@@ -75,6 +75,17 @@ ninja install -C target/
 
 ### Flatpak 📦
 
+This project is intended to be built with its own bundled WebKitGTK so WhatsApp Web
+voice/video calling works. The bundled WebKit build is the default path and is the one
+that should be used for all end-user builds.
+
+Prerequisites:
+
+```
+flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.rust-stable//23.08
+```
+
 Cargo dependencies must be vendored for offline builds (`-Dflatpak=true` passes
 `--offline` to cargo). If `vendor/` is missing, generate it first:
 
@@ -82,7 +93,7 @@ Cargo dependencies must be vendored for offline builds (`-Dflatpak=true` passes
 cargo vendor vendor
 ```
 
-Then build and install:
+Then build and install using the bundled-WebKit manifest:
 
 ```
 flatpak-builder --user --ccache --force-clean --repo=repo target-flatpak build-aux/io.github.zaedus.spider.json
@@ -90,8 +101,16 @@ flatpak --user remote-add --no-gpg-verify --if-not-exists spider-local repo
 flatpak --user install --reinstall spider-local io.github.zaedus.spider
 ```
 
+Run the app:
+
+```
+flatpak run io.github.zaedus.spider
+```
+
 Note: the first build compiles the bundled WebKitGTK and takes a while; ccache makes
-subsequent builds much faster.
+subsequent builds much faster. The `io.github.zaedus.spider.Devel.json` manifest is
+kept in sync with the same bundled-WebKit setup so local development and Builder builds
+use the same WebRTC-capable runtime.
 
 ## Thanks to these awesome people and projects! ❤️
 
